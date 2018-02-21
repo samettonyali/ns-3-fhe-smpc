@@ -1,0 +1,523 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright 2007 University of Washington
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+#include "ns3/log.h"
+#include "ns3/ipv4-address.h"
+#include "ns3/ipv6-address.h"
+#include "ns3/nstime.h"
+#include "ns3/inet-socket-address.h"
+#include "ns3/inet6-socket-address.h"
+#include "ns3/socket.h"
+#include "ns3/simulator.h"
+#include "ns3/socket-factory.h"
+#include "ns3/packet.h"
+#include "ns3/uinteger.h"
+#include "ns3/trace-source-accessor.h"
+#include "gateways.h"
+#include <ns3/random-variable-stream.h>
+#include <ns3/ipv4-address.h>
+#include <ns3/ipv4-l3-protocol.h>
+#include "ns3/tag.h"
+#include "ns3/boolean.h"
+#include "ns3/double.h"
+#include "ns3/string.h"
+#include "ns3/core-module.h"  // activate booleanvalue, makebooleanaccessor etc
+#include "ns3/udp-socket-factory.h"
+
+
+#include <iostream>
+#include <sstream>
+#include <fstream>
+
+namespace ns3 {
+
+NS_LOG_COMPONENT_DEFINE ("GatewaysApplication");
+
+NS_OBJECT_ENSURE_REGISTERED (Gateways);
+
+TypeId
+Gateways::GetTypeId (void)
+{
+  static TypeId tid = TypeId ("ns3::Gateways")
+    .SetParent<Application> ()
+    .AddConstructor<Gateways> ()
+    .AddAttribute ("RandomStartTime",
+                   "The time to wait before sending the first packet is random?",
+                   BooleanValue (true),
+                   MakeBooleanAccessor (&Gateways::m_randStartTime),
+                   MakeBooleanChecker ())
+    .AddAttribute ("RandomIntervalTime",
+    		       "The time to wait between packets is random?",
+    		       BooleanValue (false),
+    		       MakeBooleanAccessor (&Gateways::m_randIntervalTime),
+    		       MakeBooleanChecker ())
+    .AddAttribute ("Interval", 
+                   "The time in seconds to wait between packets",
+                   DoubleValue (1.0),
+                   MakeDoubleAccessor (&Gateways::m_interval),
+                   MakeDoubleChecker<double> ())
+    .AddAttribute ("PacketSize",
+                   "The byte size of each packet",
+                   UintegerValue (100),
+                   MakeUintegerAccessor (&Gateways::m_packetSize),
+                   MakeUintegerChecker<uint16_t> ())
+    .AddAttribute ("RemoteAddress", 
+                   "The destination Address of the side that its packets should be aggregated",
+                   AddressValue (),
+                   MakeAddressAccessor (&Gateways::m_peerAddress),
+                   MakeAddressChecker ())
+    .AddAttribute ("RemotePort", 
+                   "The destination port of the side that its packets should be aggregated",
+                   UintegerValue (0),
+                   MakeUintegerAccessor (&Gateways::m_peerPort),
+                   MakeUintegerChecker<uint16_t> ())
+    .AddAttribute ("Protocol", "The type of protocol to use.",
+                   TypeIdValue (UdpSocketFactory::GetTypeId ()),
+                   MakeTypeIdAccessor (&Gateways::m_tid),
+                   MakeTypeIdChecker ())
+    .AddAttribute ("AggregationTime", 
+                   "The duration of aggregation after the first packet arrived",
+                   DoubleValue (2.0),
+                   MakeDoubleAccessor (&Gateways::m_aggregationTime),
+                   MakeDoubleChecker<double> ())
+    .AddAttribute ("ReceivedFilename", "the file name of the received file",
+                    StringValue ("output/receivedLog.out"),
+                    MakeStringAccessor (&Gateways::m_receivedFilename),
+                    MakeStringChecker ())
+    .AddAttribute ("SentFilename", "the file name of the sent file",
+                    StringValue ("output/sentLog.out"),
+                    MakeStringAccessor (&Gateways::m_sentFilename),
+                    MakeStringChecker ())
+    .AddAttribute ("AggFilename", "the file name of the aggregator file",
+                    StringValue ("output/aggregateLog.out"),
+                    MakeStringAccessor (&Gateways::m_aggFilename),
+                    MakeStringChecker ())
+    .AddAttribute ( "MeshAggregationEnable",
+                    "Call mesh aggregation module when it is true",
+                    BooleanValue (false),
+                    MakeBooleanAccessor (
+                      &Gateways::m_meshAggregationEnable),
+                    MakeBooleanChecker ()
+                    )
+  ;
+  return tid;
+}
+
+Gateways::Gateways ()
+{
+  NS_LOG_FUNCTION (this);
+  m_socket = 0;
+  m_outSocket = 0;
+  m_eventSize=0;
+  m_evented=0;
+  m_aggregationTime = 2.0;
+  firstReceived=true;
+  m_meshAggregationEnable=false;
+  m_aggDataSize = 0;
+  m_totPacketReceived = 0;
+}
+
+Gateways::~Gateways()
+{
+  NS_LOG_FUNCTION (this);
+  m_socket = 0;
+  m_outSocket = 0;
+}
+
+void
+Gateways::DoDispose (void)
+{
+  NS_LOG_FUNCTION (this);
+  m_socket = 0;
+  m_socketList.clear ();
+  m_outSocket = 0;
+  m_outSocketList.clear();
+  Application::DoDispose ();
+}
+
+void 
+Gateways::StartApplication (void)
+{
+  NS_LOG_FUNCTION (this);
+  stoped=false;
+  firstReceived=true;
+  // ************** create receiver socket from mesh *****************
+  if (m_socket == 0)
+    {
+      m_socket = Socket::CreateSocket (GetNode (), m_tid);
+      
+      InetSocketAddress local = InetSocketAddress (Ipv4Address::GetAny (), m_peerPort);
+      Ipv4Address ipv4 = local.GetIpv4 ();
+       std::cout << " Local : " << local << " IP : " << ipv4 << std::endl;
+      m_socket->Bind (local);//
+      m_socket->Listen ();
+      m_socket->ShutdownSend ();
+    }
+    if (m_outSocket == 0)
+      {
+         m_outSocket = Socket::CreateSocket (GetNode (), m_tid);
+         m_outSocket->Bind ();
+         m_outSocket->Connect (InetSocketAddress (Ipv4Address::ConvertFrom(m_peerAddress), m_peerPort));
+         m_outSocket->SetAllowBroadcast (true);
+         m_outSocket->ShutdownRecv ();
+        InetSocketAddress local = InetSocketAddress (Ipv4Address::ConvertFrom(m_peerAddress), m_peerPort);
+        Ipv4Address ipv4 = local.GetIpv4 ();
+        std::cout << " Local : " << local << " IP : " << ipv4 << std::endl;
+      }
+
+	  Ptr<Ipv4> ipv4 = this->GetNode()->GetObject<Ipv4>();
+	  Ipv4InterfaceAddress iaddr = ipv4->GetAddress (1,0);
+	  Ipv4Address addri = iaddr.GetLocal ();
+	  addri.Serialize(ipLocal);
+	  Ipv4Address::ConvertFrom(m_peerAddress).Serialize(ipRemote);
+
+  m_socket->SetRecvCallback (MakeCallback (&Gateways::HandleRead, this));
+  m_socket->SetAcceptCallback (
+    MakeNullCallback<bool, Ptr<Socket>, const Address &> (),
+    MakeCallback (&Gateways::HandleAccept, this));
+  m_socket->SetCloseCallbacks (
+    MakeCallback (&Gateways::HandlePeerClose, this),
+    MakeCallback (&Gateways::HandlePeerError, this));
+
+  // ***************** create sender socket from the gateway to the remoteHost ***************** //
+  
+
+}
+
+void 
+Gateways::StopApplication ()
+{
+  NS_LOG_FUNCTION (this);
+  while(!m_socketList.empty ()) //these are accepted sockets, close them
+    {
+      Ptr<Socket> acceptedSocket = m_socketList.front ();
+      m_socketList.pop_front ();
+      acceptedSocket->Close ();
+    }
+  if (m_socket != 0) 
+    {
+      m_socket->Close ();
+      m_socket->SetRecvCallback (MakeNullCallback<void, Ptr<Socket> > ());
+      m_socket = 0;
+    }
+  stoped=true;
+}
+
+
+void 
+Gateways::ScheduleTransmit (Time dt)
+{
+	if (stoped)
+	{
+		return;
+	}
+  NS_LOG_FUNCTION (this << dt);
+  Simulator::Schedule (dt, &Gateways::Send, this);
+}
+
+void 
+Gateways::Send (void)
+{
+  NS_LOG_FUNCTION (this);
+	if (stoped)
+	{
+		return;
+	}
+  
+   if (m_totPacketReceived < 1) {
+       firstReceived = true;
+       m_waitingPacket.clear();
+       return;
+   }
+   
+   NS_LOG_INFO("Aggregation duration : " << m_aggregationTime << " secs has expires, there are " << m_totPacketReceived << " packets " << " Total Size : " << m_aggDataSize);
+
+  m_evented++;
+   for (int remain=m_eventSize;remain>0;remain=remain-m_packetSize)
+   {
+	   ++m_sent;
+ 	  uint16_t ps;
+ 	  if (remain<20)
+ 	  {
+ 		  ps=20;
+ 	  }
+ 	  else
+ 	  {
+ 		  if(m_packetSize<remain)
+ 		  {
+ 			  ps=m_packetSize;
+ 		  }
+ 		  else
+ 		  {
+ 			  ps=remain;
+ 		  }
+ 	  }
+ 	  Ptr<Packet> p;
+ 	  uint8_t buffer [ps];
+ 	  uint8_t *bPointer;
+
+ 	  buffer[0]=ipLocal[0];
+ 	  buffer[1]=ipLocal[1];
+ 	  buffer[2]=ipLocal[2];
+ 	  buffer[3]=ipLocal[3];
+ 	  for (int i = 3; i >= 0; --i)
+ 	  {
+ 	  	  buffer[i+4] = (uint8_t)((m_sent >> 8 * i) & 0xFF);
+ 	  }
+ 	  /*
+ 	  for (int i = 7; i >= 0; --i)
+ 	  {
+ 	  	  buffer[i+9] = (uint8_t)(((Simulator::Now ().GetMicroSeconds())  >> 8 * i) & 0xFF);
+ 	  }
+ 	  */
+ 	  buffer[8]=ipRemote[0];
+ 	  buffer[9]=ipRemote[1];
+ 	  buffer[10]=ipRemote[2];
+ 	  buffer[11]=ipRemote[3];
+ 	  for (int i = 3; i >= 0; --i)
+ 	  {
+ 	  	  buffer[i+12] = (uint8_t)((m_evented >> 8 * i) & 0xFF);
+ 	  }
+ 	  bPointer=buffer;
+ 	  p = Create<Packet> (bPointer,ps);
+ 	  // call to the trace sinks before the packet is actually sent,
+ 	  // so that tags added to the packet can be sent as well
+ 	  m_txTrace (p);
+         m_outSocket->Send(p);
+
+  	  if (Ipv4Address::IsMatchingType (m_peerAddress))
+ 	  {
+ 		  NS_LOG_INFO ("S "<< Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<m_sent<<"\t"
+	  			  << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<m_evented<<"\t"<<
+	  			  (uint64_t) ipRemote[0]*1000*1000*1000+ ipRemote[1]*1000*1000+ ipRemote[2]*1000+ipRemote[3] <<"\t"<< ps);
+ 	  }
+        std::ostringstream osfile;
+        osfile << m_sentFilename;
+        std::ofstream myfile (osfile.str().c_str(), std::ios::out | std::ios::app);
+	  myfile << Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<m_sent<<"\t"
+	  			  << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<m_evented<<"\t"<<
+	  			  (uint64_t) ipRemote[0]*1000*1000*1000+ ipRemote[1]*1000*1000+ ipRemote[2]*1000+ipRemote[3] <<"\t"<< ps<<"\n\r";
+	  myfile.close();
+   }
+   m_eventSize=0;/////////////////0
+
+   firstReceived = true;
+   m_totPacketReceived = 0;
+   m_aggDataSize = 0;
+}
+
+void
+Gateways::HandleRead (Ptr<Socket> socket)
+{
+  NS_LOG_FUNCTION (this << socket);
+	if (stoped)
+	{
+		return;
+	}
+  Ptr<Packet> packet;
+  Address from;
+  if (firstReceived) {
+     Simulator::Schedule(Seconds(m_aggregationTime),&Gateways::Send, this);
+     firstReceived = false;
+  }
+  while ((packet = socket->RecvFrom (from)))
+    {
+      if (InetSocketAddress::IsMatchingType (from))
+        {
+    	  uint8_t buffer [packet->GetSize() ];
+    	  uint8_t *bPointer;
+    	  bPointer=buffer;
+    	  packet->CopyData (bPointer,packet->GetSize() );
+         // **** save the packet *****************
+         DataWaitingPacket tmp;
+         tmp.from = from;
+         tmp.pkt = packet;
+         m_waitingPacket.push_back(tmp);
+         //
+         m_aggDataSize += packet->GetSize() ;
+         m_totPacketReceived += 1;
+         //
+         //
+          if(ipRemote[0]==buffer[0] &&ipRemote[1]==buffer[1] &&ipRemote[2]==buffer[2] &&ipRemote[3]==buffer[3])//data from server, send down now
+          {
+        	  NS_LOG_INFO ("R " <<Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<
+            			(uint32_t) buffer[7]*256*256*256+ buffer[6]*256*256+ buffer[5]*256+buffer[4]<<"\t"
+            			  << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<
+            			(uint32_t) buffer[15]*256*256*256+ buffer[14]*256*256+ buffer[13]*256+buffer[12]<<"\t"<<
+            			ipLocal[0]*1000*1000*1000+ ipLocal[1]*1000*1000+ ipLocal[2]*1000+ipLocal[3]<<"\t"<<packet->GetSize());
+              //std::ofstream myfile;
+              //myfile.open ("/home/farshad/Downloads/repos/ns-3-allinone/ns-3-dev/receivedLog.txt",std::ios::app);
+	     	std::ostringstream osfile;
+       	osfile << m_receivedFilename;
+        	std::ofstream myfile (osfile.str().c_str(), std::ios::out | std::ios::app);
+
+                  	  myfile << Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint32_t) buffer[0]*256*256*256+ buffer[1]*256*256+ buffer[2]*256+buffer[3]<<"\t"<<
+                  			(uint32_t) buffer[7]*256*256*256+ buffer[6]*256*256+ buffer[5]*256+buffer[4]<<"\t"
+                  			  << (uint32_t) buffer[8]*256*256*256+ buffer[9]*256*256+ buffer[10]*256+buffer[11]<<"\t"<<
+                  			(uint32_t) buffer[15]*256*256*256+ buffer[14]*256*256+ buffer[13]*256+buffer[12]<<"\t"<<
+                  			ipLocal[0]*256*256*256+ ipLocal[1]*256*256+ ipLocal[2]*256+ipLocal[3]<<"\t"<<packet->GetSize()<<"\n\r";
+              myfile.close();
+              SendDown(packet);
+          }
+          else//aggregate
+          {
+        	  m_eventSize=packet->GetSize ()+m_eventSize;
+        	  NS_LOG_INFO ("A " <<Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<
+            			(uint32_t) buffer[7]*256*256*256+ buffer[6]*256*256+ buffer[5]*256+buffer[4]<<"\t"
+            			  << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<
+            			(uint32_t) buffer[15]*256*256*256+ buffer[14]*256*256+ buffer[13]*256+buffer[12]<<"\t"<<
+            			(uint64_t)ipLocal[0]*1000*1000*1000+ ipLocal[1]*1000*1000+ ipLocal[2]*1000+ipLocal[3]<<"\t"<<packet->GetSize()<<"\t"<<m_evented);
+              //std::ofstream myfile;
+              //myfile.open ("/home/farshad/Downloads/repos/ns-3-allinone/ns-3-dev/aggregatedLog.txt",std::ios::app);
+	       std::ostringstream osfile;
+              osfile << m_aggFilename;
+              std::ofstream myfile (osfile.str().c_str(), std::ios::out | std::ios::app);
+                	  myfile << Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<
+                  			(uint32_t) buffer[7]*256*256*256+ buffer[6]*256*256+ buffer[5]*256+buffer[4]<<"\t"
+                  			  << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<
+                  			(uint32_t) buffer[15]*256*256*256+ buffer[14]*256*256+ buffer[13]*256+buffer[12]<<"\t"<<
+                  			(uint64_t)ipLocal[0]*1000*1000*1000+ ipLocal[1]*1000*1000+ ipLocal[2]*1000+ipLocal[3]<<"\t"<<packet->GetSize()<<"\t"<<m_evented<<"\n\r";
+              myfile.close();
+          }
+        }
+    }
+}
+
+void
+Gateways::SendDown(Ptr<Packet> packet)
+{
+	if (stoped)
+	{
+		return;
+	}
+	uint8_t buffer [packet->GetSize() ];
+	    	  uint8_t *bPointer;
+	    	  bPointer=buffer;
+	    	  packet->CopyData (bPointer,packet->GetSize() );
+
+	    	  Ipv4Address m_Ipv4Address;
+	    	  m_Ipv4Address.Set(buffer[8]*256*256*256+buffer[9]*256*256+buffer[10]*256+buffer[11]);
+	    	  ipTemp[0]=buffer[0];
+	    	  ipTemp[1]=buffer[1];
+	    	  ipTemp[2]=buffer[2];
+	    	  ipTemp[3]=buffer[3];
+	          TypeId tid = TypeId::LookupByName ("ns3::UdpSocketFactory");
+	          Ptr<Socket> m_socket;
+	          m_socket = Socket::CreateSocket (GetNode (), tid);
+	          m_socket->Bind();
+	          m_socket->Connect (InetSocketAddress (m_Ipv4Address, m_peerPort));
+
+	          NS_LOG_FUNCTION (this);
+
+	             for (int remain=packet->GetSize();remain>0;remain=remain-m_packetSize)
+	             {
+	            	 ++m_sent;
+	           	  uint16_t ps;
+	           	  if (remain<20)
+	           	  {
+	           		  ps=20;
+	           	  }
+	           	  else
+	           	  {
+	           		  if(m_packetSize<remain)
+	           		  {
+	           			  ps=m_packetSize;
+	           		  }
+	           		  else
+	           		  {
+	           			  ps=remain;
+	           		  }
+	           	  }
+	           	  Ptr<Packet> p;
+	           	  uint8_t buffer [ps];
+	           	  uint8_t *bPointer;
+
+	           	  buffer[0]=ipLocal[0];
+	           	  buffer[1]=ipLocal[1];
+	           	  buffer[2]=ipLocal[2];
+	           	  buffer[3]=ipLocal[3];
+	           	  for (int i = 3; i >= 0; --i)
+	           	  {
+	           	  	  buffer[i+4] = (uint8_t)((m_sent >> 8 * i) & 0xFF);
+	           	  }
+	           	  /*
+	           	  for (int i = 7; i >= 0; --i)
+	           	  {
+	           	  	  buffer[i+9] = (uint8_t)(((Simulator::Now ().GetMicroSeconds())  >> 8 * i) & 0xFF);
+	           	  }
+	           	  */
+	           	  buffer[8]=ipTemp[0];
+	           	  buffer[9]=ipTemp[1];
+	           	  buffer[10]=ipTemp[2];
+	           	  buffer[11]=ipTemp[3];
+	           	  for (int i = 3; i >= 0; --i)
+	           	  {
+	           	  	  buffer[i+12] = (uint8_t)((m_evented >> 8 * i) & 0xFF);
+	           	  }
+	           	  bPointer=buffer;
+	           	  p = Create<Packet> (bPointer,ps);
+	           	  // call to the trace sinks before the packet is actually sent,
+	           	  // so that tags added to the packet can be sent as well
+	           	  m_txTrace (p);
+	           	  m_socket->Send (p);
+
+	            	  if (Ipv4Address::IsMatchingType (m_Ipv4Address))
+	           	  {
+	             		  NS_LOG_INFO ("S "<< Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<m_sent<<"\t"
+	             				 << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<m_evented<<"\t"<<
+	             				(uint64_t) ipTemp[0]*1000*1000*1000+ ipTemp[1]*1000*1000+ ipTemp[2]*1000+ipTemp[3] <<"\t"<<ps);
+	           	  }
+
+	            	  //std::ofstream myfile;
+	            	  //myfile.open ("/home/farshad/Downloads/repos/ns-3-allinone/ns-3-dev/sentLog.txt",std::ios::app);
+                          std::ostringstream osfile;
+                          osfile << m_sentFilename;
+                          std::ofstream myfile (osfile.str().c_str(), std::ios::out | std::ios::app);
+	            	  myfile << Simulator::Now ().GetMicroSeconds()<<"\t"<< (uint64_t) buffer[0]*1000*1000*1000+ buffer[1]*1000*1000+ buffer[2]*1000+buffer[3]<<"\t"<<m_sent<<"\t"
+	             				 << (uint64_t) buffer[8]*1000*1000*1000+ buffer[9]*1000*1000+ buffer[10]*1000+buffer[11]<<"\t"<<m_evented<<"\t"<<
+	             				(uint64_t) ipTemp[0]*1000*1000*1000+ ipTemp[1]*1000*1000+ ipTemp[2]*1000+ipTemp[3] <<"\t"<<ps<<"\n\r";
+	            	  myfile.close();
+	             }
+
+	          m_socket->Close ();
+}
+void 
+Gateways::HandlePeerClose (Ptr<Socket> socket)
+{
+  NS_LOG_FUNCTION (this << socket);
+}
+ 
+void 
+Gateways::HandlePeerError (Ptr<Socket> socket)
+{
+  NS_LOG_FUNCTION (this << socket);
+}
+ 
+
+void 
+Gateways::HandleAccept (Ptr<Socket> s, const Address& from)
+{
+  NS_LOG_FUNCTION (this << s << from);
+  s->SetRecvCallback (MakeCallback (&Gateways::HandleRead, this));
+  m_socketList.push_back (s);
+}
+
+
+
+} // Namespace ns3
+
+

@@ -1,0 +1,10 @@
+# -*- Mode: python; py-indent-offset: 4; indent-tabs-mode: nil; coding: utf-8; -*-
+
+def build(bld):
+    obj = bld.create_ns3_program('ltp-protocol-example', ['ltp-protocol', 'core', 'internet', 'network', 'point-to-point'])
+    obj.source = 'ltp-protocol-example.cc'
+
+    obj = bld.create_ns3_program('ltp-protocol-long-transmission-example', ['ltp-protocol', 'core', 'internet', 'network', 'point-to-point','flow-monitor'])
+    obj.source = 'ltp-protocol-long-transmission-example.cc'
+
+

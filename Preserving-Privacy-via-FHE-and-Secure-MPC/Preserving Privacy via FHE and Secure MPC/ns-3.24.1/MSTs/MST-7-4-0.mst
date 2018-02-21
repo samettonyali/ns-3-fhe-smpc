@@ -1,0 +1,42 @@
+# Leaf Meter IDs
+4
+
+3
+4
+5
+6
+
+# Parent Meter IDs
+4
+
+1
+1
+2
+2
+
+# Agg Meter IDs
+2
+
+1
+2
+
+# Parent IDs of Agg Meters
+2
+
+0
+0
+
+# Number of Branches of the Sink
+2
+
+# Number of Branches of Agg Meters
+2
+
+2
+2
+
+# Total Number of Children of Agg Meters
+2
+
+2
+2
